@@ -10,6 +10,7 @@ app = Flask(__name__)
 
 SUPABASE_URL = "https://kjtohbkajcscayckyypi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtqdG9oYmthamNzY2F5Y2t5eXBpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5OTkzMTgsImV4cCI6MjA5NjU3NTMxOH0.VzKnzpf4VFi06kn28Wz_b8kcWwujF7d5lQG0Xwa6aiw"
+PDF_PASSWORD = "0812"
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -20,19 +21,18 @@ HEADERS = {
 
 def decode_pdf(raw_body):
     """Handle both raw binary and base64-encoded PDF from Power Automate."""
-    # If it's bytes, try to decode as base64 first
     if isinstance(raw_body, bytes):
+        # Try base64 decode first
         try:
             decoded = base64.b64decode(raw_body)
-            # Check if decoded result is a valid PDF
             if decoded[:4] == b'%PDF':
                 return decoded
         except Exception:
             pass
-        # If not base64 or decode fails, use as-is
+        # Use as-is if already PDF
         if raw_body[:4] == b'%PDF':
             return raw_body
-        # Try stripping quotes if wrapped in a string
+        # Try stripping quotes
         try:
             text = raw_body.decode('utf-8').strip().strip('"')
             decoded = base64.b64decode(text)
@@ -41,6 +41,19 @@ def decode_pdf(raw_body):
         except Exception:
             pass
     return raw_body
+
+def open_pdf(pdf_bytes):
+    """Try opening PDF with password, fall back to no password."""
+    try:
+        pdf = pdfplumber.open(BytesIO(pdf_bytes), password=PDF_PASSWORD)
+        return pdf
+    except Exception:
+        pass
+    try:
+        pdf = pdfplumber.open(BytesIO(pdf_bytes))
+        return pdf
+    except Exception as e:
+        raise Exception(f"Could not open PDF: {str(e)}")
 
 def normalize_reason(r):
     r = r.strip().upper()
@@ -56,7 +69,7 @@ def normalize_reason(r):
 
 def parse_pending(pdf_bytes, source_file):
     records = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+    with open_pdf(pdf_bytes) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
@@ -81,9 +94,9 @@ def parse_pending(pdf_bytes, source_file):
                 parts = [p for p in [first, middle, last, suffix] if p]
                 full_name = " ".join(parts)
 
-                # Clean up app_date — keep only the date portion
-                if app_date:
-                    app_date = app_date.split(" ")[0] if " " in app_date else app_date
+                # Keep only date portion
+                if app_date and " " in app_date:
+                    app_date = app_date.split(" ")[0]
 
                 records.append({
                     "row_no": no,
@@ -98,7 +111,7 @@ def parse_pending(pdf_bytes, source_file):
 
 def parse_approved(pdf_bytes, source_file, date_approved):
     records = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+    with open_pdf(pdf_bytes) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
