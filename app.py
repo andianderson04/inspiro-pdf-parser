@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import pdfplumber
 import requests
 from flask import Flask, request, jsonify
@@ -16,6 +17,30 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates"
 }
+
+def decode_pdf(raw_body):
+    """Handle both raw binary and base64-encoded PDF from Power Automate."""
+    # If it's bytes, try to decode as base64 first
+    if isinstance(raw_body, bytes):
+        try:
+            decoded = base64.b64decode(raw_body)
+            # Check if decoded result is a valid PDF
+            if decoded[:4] == b'%PDF':
+                return decoded
+        except Exception:
+            pass
+        # If not base64 or decode fails, use as-is
+        if raw_body[:4] == b'%PDF':
+            return raw_body
+        # Try stripping quotes if wrapped in a string
+        try:
+            text = raw_body.decode('utf-8').strip().strip('"')
+            decoded = base64.b64decode(text)
+            if decoded[:4] == b'%PDF':
+                return decoded
+        except Exception:
+            pass
+    return raw_body
 
 def normalize_reason(r):
     r = r.strip().upper()
@@ -41,21 +66,24 @@ def parse_pending(pdf_bytes, source_file):
                     continue
                 try:
                     no = int(str(row[0]).strip())
-                except:
+                except Exception:
                     continue
-                first   = str(row[1] or "").strip()
-                middle  = str(row[2] or "").strip()
-                last    = str(row[3] or "").strip()
-                suffix  = str(row[4] or "").strip()
-                app_date= str(row[5] or "").strip()
-                dob     = str(row[6] or "").strip()
-                mobile  = str(row[7] or "").strip()
-                reason  = str(row[8] or "").strip()
 
-                parts = [first, middle, last]
-                if suffix:
-                    parts.append(suffix)
-                full_name = " ".join(p for p in parts if p)
+                first    = str(row[1] or "").strip()
+                middle   = str(row[2] or "").strip()
+                last     = str(row[3] or "").strip()
+                suffix   = str(row[4] or "").strip()
+                app_date = str(row[5] or "").strip()
+                dob      = str(row[6] or "").strip()
+                mobile   = str(row[7] or "").strip()
+                reason   = str(row[8] or "").strip()
+
+                parts = [p for p in [first, middle, last, suffix] if p]
+                full_name = " ".join(parts)
+
+                # Clean up app_date — keep only the date portion
+                if app_date:
+                    app_date = app_date.split(" ")[0] if " " in app_date else app_date
 
                 records.append({
                     "row_no": no,
@@ -63,7 +91,7 @@ def parse_pending(pdf_bytes, source_file):
                     "date_of_birth": dob,
                     "application_date": app_date,
                     "mobile_number": mobile,
-                    "reason": normalize_reason(reason),
+                    "reason": normalize_reason(reason) if reason else "",
                     "source_file": source_file
                 })
     return records
@@ -80,8 +108,9 @@ def parse_approved(pdf_bytes, source_file, date_approved):
                     continue
                 try:
                     no = int(str(row[0]).strip())
-                except:
+                except Exception:
                     continue
+
                 first   = str(row[1] or "").strip()
                 middle  = str(row[2] or "").strip()
                 last    = str(row[3] or "").strip()
@@ -89,10 +118,8 @@ def parse_approved(pdf_bytes, source_file, date_approved):
                 account = str(row[5] or "").strip()
                 branch  = str(row[6] or "").strip()
 
-                parts = [first, middle, last]
-                if suffix:
-                    parts.append(suffix)
-                full_name = " ".join(p for p in parts if p)
+                parts = [p for p in [first, middle, last, suffix] if p]
+                full_name = " ".join(parts)
 
                 records.append({
                     "row_no": no,
@@ -106,30 +133,38 @@ def parse_approved(pdf_bytes, source_file, date_approved):
 
 def save_to_supabase(table, records):
     if not records:
-        return {"saved": 0}
+        return {"saved": 0, "message": "No records parsed"}
     res = requests.post(
         f"{SUPABASE_URL}/rest/v1/{table}",
         headers=HEADERS,
         json=records
     )
-    return {"saved": len(records), "status": res.status_code}
+    return {"saved": len(records), "status": res.status_code, "response": res.text}
 
 @app.route("/parse-pending", methods=["POST"])
 def handle_pending():
-    pdf_bytes   = request.data
-    source_file = request.headers.get("X-Source-File", "unknown")
-    records     = parse_pending(pdf_bytes, source_file)
-    result      = save_to_supabase("pending", records)
-    return jsonify(result)
+    try:
+        raw = request.data
+        pdf_bytes = decode_pdf(raw)
+        source_file = request.headers.get("X-Source-File", "unknown")
+        records = parse_pending(pdf_bytes, source_file)
+        result = save_to_supabase("pending", records)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/parse-approved", methods=["POST"])
 def handle_approved():
-    pdf_bytes    = request.data
-    source_file  = request.headers.get("X-Source-File", "unknown")
-    date_approved= request.headers.get("X-Date-Approved", "")
-    records      = parse_approved(pdf_bytes, source_file, date_approved)
-    result       = save_to_supabase("approved", records)
-    return jsonify(result)
+    try:
+        raw = request.data
+        pdf_bytes = decode_pdf(raw)
+        source_file = request.headers.get("X-Source-File", "unknown")
+        date_approved = request.headers.get("X-Date-Approved", "")
+        records = parse_approved(pdf_bytes, source_file, date_approved)
+        result = save_to_supabase("approved", records)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
