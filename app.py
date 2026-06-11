@@ -10,7 +10,8 @@ app = Flask(__name__)
 
 SUPABASE_URL = "https://kjtohbkajcscayckyypi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtqdG9oYmthamNzY2F5Y2t5eXBpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5OTkzMTgsImV4cCI6MjA5NjU3NTMxOH0.VzKnzpf4VFi06kn28Wz_b8kcWwujF7d5lQG0Xwa6aiw"
-PDF_PASSWORD = "0812"
+
+PDF_PASSWORDS = ["0812", "9891"]
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -22,17 +23,14 @@ HEADERS = {
 def decode_pdf(raw_body):
     """Handle both raw binary and base64-encoded PDF from Power Automate."""
     if isinstance(raw_body, bytes):
-        # Try base64 decode first
         try:
             decoded = base64.b64decode(raw_body)
             if decoded[:4] == b'%PDF':
                 return decoded
         except Exception:
             pass
-        # Use as-is if already PDF
         if raw_body[:4] == b'%PDF':
             return raw_body
-        # Try stripping quotes
         try:
             text = raw_body.decode('utf-8').strip().strip('"')
             decoded = base64.b64decode(text)
@@ -43,17 +41,52 @@ def decode_pdf(raw_body):
     return raw_body
 
 def open_pdf(pdf_bytes):
-    """Try opening PDF with password, fall back to no password."""
+    """Try opening PDF with known passwords, fall back to no password."""
+    for pwd in PDF_PASSWORDS:
+        try:
+            return pdfplumber.open(BytesIO(pdf_bytes), password=pwd)
+        except Exception:
+            continue
     try:
-        pdf = pdfplumber.open(BytesIO(pdf_bytes), password=PDF_PASSWORD)
-        return pdf
-    except Exception:
-        pass
-    try:
-        pdf = pdfplumber.open(BytesIO(pdf_bytes))
-        return pdf
+        return pdfplumber.open(BytesIO(pdf_bytes))
     except Exception as e:
-        raise Exception(f"Could not open PDF: {str(e)}")
+        raise Exception(f"Could not open PDF with any known password: {str(e)}")
+
+def detect_company(source_file, full_text=""):
+    """Detect company from source filename/subject or PDF text."""
+    combined = (source_file + " " + full_text).upper()
+    if "INFOCOM" in combined:
+        return "Infocom"
+    if "INSPIRO" in combined:
+        return "Inspiro"
+    return "Inspiro"  # default
+
+def extract_approved_date(full_text):
+    """
+    Extract the approval date from text like:
+    'Successful Payroll Accounts Opened on 06/10/2026 - 06/11/2026 via Digital Payroll Portal'
+    Returns the LAST (end) date in MM/DD/YYYY -> YYYY-MM-DD format.
+    """
+    pattern = r"Opened on\s+(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})"
+    match = re.search(pattern, full_text, re.IGNORECASE)
+    if match:
+        end_date = match.group(2)
+        try:
+            mm, dd, yyyy = end_date.split("/")
+            return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+        except Exception:
+            return end_date
+    # Fallback: any single date pattern "Opened on MM/DD/YYYY"
+    pattern2 = r"Opened on\s+(\d{1,2}/\d{1,2}/\d{4})"
+    match2 = re.search(pattern2, full_text, re.IGNORECASE)
+    if match2:
+        d = match2.group(1)
+        try:
+            mm, dd, yyyy = d.split("/")
+            return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+        except Exception:
+            return d
+    return ""
 
 def normalize_reason(r):
     r = r.strip().upper()
@@ -70,6 +103,9 @@ def normalize_reason(r):
 def parse_pending(pdf_bytes, source_file):
     records = []
     with open_pdf(pdf_bytes) as pdf:
+        full_text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+        company = detect_company(source_file, full_text)
+
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
@@ -94,7 +130,6 @@ def parse_pending(pdf_bytes, source_file):
                 parts = [p for p in [first, middle, last, suffix] if p]
                 full_name = " ".join(parts)
 
-                # Keep only date portion
                 if app_date and " " in app_date:
                     app_date = app_date.split(" ")[0]
 
@@ -105,13 +140,18 @@ def parse_pending(pdf_bytes, source_file):
                     "application_date": app_date,
                     "mobile_number": mobile,
                     "reason": normalize_reason(reason) if reason else "",
-                    "source_file": source_file
+                    "source_file": source_file,
+                    "company": company
                 })
     return records
 
-def parse_approved(pdf_bytes, source_file, date_approved):
+def parse_approved(pdf_bytes, source_file, fallback_date=""):
     records = []
     with open_pdf(pdf_bytes) as pdf:
+        full_text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+        company = detect_company(source_file, full_text)
+        date_approved = extract_approved_date(full_text) or fallback_date
+
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
@@ -140,7 +180,8 @@ def parse_approved(pdf_bytes, source_file, date_approved):
                     "account_number": account,
                     "rcbc_branch": branch,
                     "date_approved": date_approved,
-                    "source_file": source_file
+                    "source_file": source_file,
+                    "company": company
                 })
     return records
 
@@ -172,8 +213,8 @@ def handle_approved():
         raw = request.data
         pdf_bytes = decode_pdf(raw)
         source_file = request.headers.get("X-Source-File", "unknown")
-        date_approved = request.headers.get("X-Date-Approved", "")
-        records = parse_approved(pdf_bytes, source_file, date_approved)
+        fallback_date = request.headers.get("X-Date-Approved", "")
+        records = parse_approved(pdf_bytes, source_file, fallback_date)
         result = save_to_supabase("approved", records)
         return jsonify(result), 200
     except Exception as e:
