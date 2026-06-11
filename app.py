@@ -185,11 +185,14 @@ def parse_approved(pdf_bytes, source_file, fallback_date=""):
                 })
     return records
 
-def save_to_supabase(table, records):
+def save_to_supabase(table, records, on_conflict=None):
     if not records:
         return {"saved": 0, "message": "No records parsed"}
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if on_conflict:
+        url += f"?on_conflict={on_conflict}"
     res = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{table}",
+        url,
         headers=HEADERS,
         json=records
     )
@@ -215,7 +218,7 @@ def handle_approved():
         source_file = request.headers.get("X-Source-File", "unknown")
         fallback_date = request.headers.get("X-Date-Approved", "")
         records = parse_approved(pdf_bytes, source_file, fallback_date)
-        result = save_to_supabase("approved", records)
+        result = save_to_supabase("approved", records, on_conflict="account_number")
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
