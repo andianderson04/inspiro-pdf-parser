@@ -220,6 +220,20 @@ def handle_approved():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/debug-pdf", methods=["POST"])
+def debug_pdf():
+    try:
+        raw = request.data
+        pdf_bytes = decode_pdf(raw)
+        with open_pdf(pdf_bytes) as pdf:
+            pages_text = []
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or "(no text extracted)"
+                pages_text.append({"page": i+1, "text": text[:1000]})
+        return jsonify({"pages": pages_text}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
