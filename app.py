@@ -2,6 +2,7 @@ import os
 import re
 import base64
 import pdfplumber
+import openpyxl
 import requests
 from flask import Flask, request, jsonify
 from io import BytesIO
@@ -185,15 +186,83 @@ def parse_approved(pdf_bytes, source_file, fallback_date=""):
                 })
     return records
 
-def save_to_supabase(table, records, on_conflict=None):
+def parse_approved_xlsx(file_bytes, source_file):
+    """Parse the cumulative Excel master list of approved accounts."""
+    records = []
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    company = detect_company(source_file)
+
+    # Find header row (assume row 1) and map columns
+    headers = [str(c.value or "").strip().lower() for c in ws[1]]
+
+    def col_idx(*names):
+        for name in names:
+            for i, h in enumerate(headers):
+                if name in h:
+                    return i
+        return None
+
+    idx_first  = col_idx("first name")
+    idx_middle = col_idx("middle name")
+    idx_last   = col_idx("last name")
+    idx_suffix = col_idx("suffix")
+    idx_acct   = col_idx("account number", "account no")
+    idx_branch = col_idx("branch")
+    idx_date   = col_idx("disposition date", "date approved", "date")
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if idx_acct is None or idx_acct >= len(row):
+            continue
+        account = str(row[idx_acct] or "").strip()
+        if not account:
+            continue
+
+        first  = str(row[idx_first] or "").strip()  if idx_first  is not None else ""
+        middle = str(row[idx_middle] or "").strip() if idx_middle is not None else ""
+        last   = str(row[idx_last] or "").strip()   if idx_last   is not None else ""
+        suffix = str(row[idx_suffix] or "").strip() if idx_suffix is not None else ""
+        branch = str(row[idx_branch] or "").strip() if idx_branch is not None else ""
+
+        date_val = row[idx_date] if idx_date is not None and idx_date < len(row) else ""
+        if hasattr(date_val, "strftime"):
+            date_approved = date_val.strftime("%Y-%m-%d")
+        else:
+            date_str = str(date_val or "").strip()
+            # Try MM-DD-YYYY or MM/DD/YYYY -> YYYY-MM-DD
+            m = re.match(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", date_str)
+            if m:
+                mm, dd, yyyy = m.groups()
+                date_approved = f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+            else:
+                date_approved = date_str
+
+        parts = [p for p in [first, middle, last, suffix] if p]
+        full_name = " ".join(parts)
+
+        records.append({
+            "full_name": full_name,
+            "account_number": account,
+            "rcbc_branch": branch,
+            "date_approved": date_approved,
+            "source_file": source_file,
+            "company": company
+        })
+    return records
+
+def save_to_supabase(table, records, on_conflict=None, ignore_duplicates=False):
     if not records:
         return {"saved": 0, "message": "No records parsed"}
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     if on_conflict:
         url += f"?on_conflict={on_conflict}"
+    headers = dict(HEADERS)
+    if ignore_duplicates:
+        headers["Prefer"] = "resolution=ignore-duplicates"
     res = requests.post(
         url,
-        headers=HEADERS,
+        headers=headers,
         json=records
     )
     return {"saved": len(records), "status": res.status_code, "response": res.text}
@@ -214,11 +283,27 @@ def handle_pending():
 def handle_approved():
     try:
         raw = request.data
-        pdf_bytes = decode_pdf(raw)
         source_file = request.headers.get("X-Source-File", "unknown")
-        fallback_date = request.headers.get("X-Date-Approved", "")
-        records = parse_approved(pdf_bytes, source_file, fallback_date)
-        result = save_to_supabase("approved", records, on_conflict="account_number")
+
+        # Detect xlsx by magic bytes (PK = zip-based office format) or raw not matching %PDF
+        file_bytes = raw
+        try:
+            decoded = base64.b64decode(raw)
+            file_bytes = decoded
+        except Exception:
+            file_bytes = raw
+
+        if file_bytes[:2] == b'PK':
+            # Excel file (.xlsx is a zip archive)
+            records = parse_approved_xlsx(file_bytes, source_file)
+            result = save_to_supabase("approved", records, on_conflict="account_number", ignore_duplicates=True)
+        else:
+            # Fallback: legacy PDF support
+            pdf_bytes = decode_pdf(raw)
+            fallback_date = request.headers.get("X-Date-Approved", "")
+            records = parse_approved(pdf_bytes, source_file, fallback_date)
+            result = save_to_supabase("approved", records, on_conflict="account_number", ignore_duplicates=True)
+
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
