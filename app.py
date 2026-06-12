@@ -209,7 +209,6 @@ def decrypt_xlsx(file_bytes):
 def parse_approved_xlsx(file_bytes, source_file):
     """Parse the cumulative Excel master list of approved accounts."""
     records = []
-    file_bytes = decrypt_xlsx(file_bytes)
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb.active
 
@@ -306,7 +305,7 @@ def handle_approved():
         raw = request.data
         source_file = request.headers.get("X-Source-File", "unknown")
 
-        # Detect xlsx by magic bytes (PK = zip-based office format) or raw not matching %PDF
+        # Get base bytes (handle base64 wrapping from Power Automate)
         file_bytes = raw
         try:
             decoded = base64.b64decode(raw)
@@ -314,12 +313,32 @@ def handle_approved():
         except Exception:
             file_bytes = raw
 
+        is_xlsx = False
+        is_pdf = False
+
+        # Already a plain zip-based xlsx?
         if file_bytes[:2] == b'PK':
-            # Excel file (.xlsx is a zip archive)
+            is_xlsx = True
+        # Already a plain PDF?
+        elif file_bytes[:4] == b'%PDF':
+            is_pdf = True
+        # Encrypted OOXML container (CFB) -> try decrypting as xlsx
+        elif file_bytes[:4] == b'\xd0\xcf\x11\xe0':
+            decrypted = decrypt_xlsx(file_bytes)
+            if decrypted[:2] == b'PK':
+                file_bytes = decrypted
+                is_xlsx = True
+            else:
+                # Could still be an encrypted PDF; let open_pdf try passwords
+                is_pdf = True
+        else:
+            # Unknown - try PDF path as last resort
+            is_pdf = True
+
+        if is_xlsx:
             records = parse_approved_xlsx(file_bytes, source_file)
             result = save_to_supabase("approved", records, on_conflict="account_number", ignore_duplicates=True)
         else:
-            # Fallback: legacy PDF support
             pdf_bytes = decode_pdf(raw)
             fallback_date = request.headers.get("X-Date-Approved", "")
             records = parse_approved(pdf_bytes, source_file, fallback_date)
