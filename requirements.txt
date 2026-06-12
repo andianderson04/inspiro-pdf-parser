@@ -2,3 +2,4 @@ flask
 gunicorn
 pdfplumber
 requests
+openpyxl
