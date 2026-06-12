@@ -3,6 +3,7 @@ import re
 import base64
 import pdfplumber
 import openpyxl
+import msoffcrypto
 import requests
 from flask import Flask, request, jsonify
 from io import BytesIO
@@ -186,10 +187,30 @@ def parse_approved(pdf_bytes, source_file, fallback_date=""):
                 })
     return records
 
+XLSX_PASSWORDS = ["0812", "9891"]
+
+def decrypt_xlsx(file_bytes):
+    """Try to decrypt password-protected xlsx; return plain bytes."""
+    for pwd in XLSX_PASSWORDS:
+        try:
+            office_file = msoffcrypto.OfficeFile(BytesIO(file_bytes))
+            office_file.load_key(password=pwd)
+            decrypted = BytesIO()
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+            data = decrypted.read()
+            if data[:2] == b'PK':
+                return data
+        except Exception:
+            continue
+    # Not encrypted or no password worked - return as-is
+    return file_bytes
+
 def parse_approved_xlsx(file_bytes, source_file):
     """Parse the cumulative Excel master list of approved accounts."""
     records = []
-    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    file_bytes = decrypt_xlsx(file_bytes)
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb.active
 
     company = detect_company(source_file)
